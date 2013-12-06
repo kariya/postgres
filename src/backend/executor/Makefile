@@ -24,6 +24,11 @@ OBJS = execAmi.o execCurrent.o execGrouping.o execJunk.o execMain.o \
        nodeSeqscan.o nodeSetOp.o nodeSort.o nodeUnique.o \
        nodeValuesscan.o nodeCtescan.o nodeWorktablescan.o \
        nodeGroup.o nodeSubplan.o nodeSubqueryscan.o nodeTidscan.o \
-       nodeForeignscan.o nodeWindowAgg.o tstoreReceiver.o spi.o
+       nodeForeignscan.o nodeWindowAgg.o tstoreReceiver.o spi.o \
+       x64.o 
 
 include $(top_srcdir)/src/backend/common.mk
+
+x64.c: x64.asm
+	./dasm-x64.sh $< > $@ 
+

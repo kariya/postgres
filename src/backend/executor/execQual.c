@@ -4304,6 +4304,392 @@ ExecEvalExprSwitchContext(ExprState *expression,
 }
 
 
+/* 0----------------------------------*/
+#define MD5_HASH_LEN 32 
+#define SAMESIGN(a,b)      (((a) < 0) == ((b) < 0))
+
+int vm_level;
+
+static Datum
+ExecEvalVm(VmNode* vmnode, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone) 
+{ 
+if (vm_level == 2) {
+	if (vmnode->jit == NULL) {
+		vmnode->jit = jitCompile(vmnode->ops);
+	}
+	Datum v = jitGo(vmnode, econtext, isNull, isDone);
+	return v;
+} else {
+	Datum val;
+	int pc = 0;
+	long stack[256], *stackp = stack;
+
+	//if (vmnode != NULL && vmnode->nops != 0) return;
+
+	for (pc = 0; pc < vmnode->nops; ++pc) {
+		VmOp op = vmnode->ops[pc];
+// elog(NOTICE, "pc=%d: %d", pc, op);
+		switch (op) {
+			case VM_NOP:
+				break;
+			case VM_CALL:
+			{
+				//int op = vmnode->ops[pc++];
+				ExprState *s = *((ExprState **) &(vmnode->ops[pc+1]));
+				pc += sizeof(void*);
+				val = (*(ExprStateEvalFunc) (s->evalfunc))(s, econtext, isNull, isDone);
+			}
+				break;
+			case VM_CALL2:
+			{
+				int op = *(int*)&vmnode->ops[pc+1];
+				pc += sizeof(int);
+				ExprState *s = *((ExprState **) &(vmnode->ops[pc+1]));
+				pc += sizeof(void*);
+				val = (*(ExprStateEvalFunc) (s->evalfunc))(s, econtext, isNull, isDone);
+elog(NOTICE, "call2! %d", op); 
+			}
+				break;
+			case VM_RET:
+				if (isDone) *isDone = ExprSingleResult;
+				if (isNull) *isNull= 0;
+				return val;
+			case VM_LITERAL:
+				val = *(Datum *) &(vmnode->ops[pc+1]);
+				pc += sizeof(Datum);
+				//*isNull = ((Const *) vmnode->xprstate.expr)->constisnull;
+				break;
+			case VM_PUSH:
+				*stackp++ = val;
+				break;
+			case VM_ADD32:
+			{
+				long op2 = DatumGetInt32(*--stackp);
+				long op1 = DatumGetInt32(*--stackp);
+				long result = op1 + op2;
+				if (SAMESIGN(op1, op2) && !SAMESIGN(result, op1)) elog(ERROR, "overflow");
+				val = Int32GetDatum(result); 
+			}
+				break;
+			case VM_SUB32:
+			{
+				long op2 = DatumGetInt32(*--stackp);
+				long op1 = DatumGetInt32(*--stackp);
+				long result = op1 - op2;
+				if (!SAMESIGN(op1, op2) && !SAMESIGN(result, op1)) elog(ERROR, "overflow");
+				val = Int32GetDatum(result); 
+			}
+				break;
+			case VM_MULT32:
+			{
+				long op2 = DatumGetInt32(*--stackp);
+				long op1 = DatumGetInt32(*--stackp);
+				long result = op1 * op2;
+				// TODO overflow check
+				val = Int32GetDatum(result); 
+			}
+				break;
+			case VM_ADD64:
+			{
+				long op2 = DatumGetInt32(*--stackp);
+				long op1 = DatumGetInt32(*--stackp);
+				long result = op1 + op2;
+				if (SAMESIGN(op1, op2) && !SAMESIGN(result, op1)) elog(ERROR, "overflow");
+				val = Int64GetDatum(result); 
+			}
+				break;
+			case VM_INT64:
+			{
+				int op1 = DatumGetInt32(*--stackp);
+				long result = op1;
+				val = Int64GetDatum(result); 
+			}
+				break;
+			case VM_INT32LT:
+			{
+				int op2 = DatumGetInt32(*--stackp);
+				int op1 = DatumGetInt32(*--stackp);
+				int result = op1 < op2;
+				val = BoolGetDatum(result); 
+			}
+				break;
+			case VM_INT32EQ:
+			{
+				int op2 = DatumGetInt32(*--stackp);
+				int op1 = DatumGetInt32(*--stackp);
+				int result = op1 == op2;
+				val = BoolGetDatum(result); 
+			}
+				break;
+			case VM_TEXTEQ:
+			{
+				Datum arg2 = *--stackp;
+				Datum arg1 = *--stackp;
+        			int len1 = toast_raw_datum_size(arg1);
+        			int len2 = toast_raw_datum_size(arg2);
+        			if (len1 != len2)
+				{
+					val = BoolGetDatum(false);
+				}
+				else
+				{
+					text* targ2 = DatumGetTextPP(arg2);
+					text* targ1 = DatumGetTextPP(arg1);
+					int result = (memcmp(VARDATA_ANY(targ1), VARDATA_ANY(targ2), len1 - VARHDRSZ) == 0);
+					val = BoolGetDatum(result); 
+				}
+			}
+				break;
+			case VM_MD5TEXT:
+			{
+        			text       *in_text = DatumGetTextPP(*--stackp);
+			        size_t          len;
+			        char            hexsum[MD5_HASH_LEN + 1];
+
+        			len = VARSIZE_ANY_EXHDR(in_text);
+
+  			      	if (pg_md5_hash(VARDATA_ANY(in_text), len, hexsum) == false)
+    			            ereport(ERROR,
+                        	        (errcode(ERRCODE_OUT_OF_MEMORY),
+                                	 errmsg("out of memory")));
+
+        			val = PointerGetDatum(cstring_to_text(hexsum));
+			}
+				break;
+			case VM_INT32OUT:
+			{
+				int arg1= DatumGetInt32(*--stackp);
+			        char *result = (char *) palloc(12);       /* sign, 10 digits, '\0' */
+
+			        pg_ltoa(arg1, result);
+        			val = CStringGetDatum(result);
+			}
+				break;
+			case VM_TEXTIN:
+			{
+				char *arg3 = *--stackp;
+				char *arg2 = *--stackp;
+				char *arg1 = DatumGetCString(*--stackp);
+        			val = PointerGetDatum(cstring_to_text(arg1));
+			}
+				break;
+			case VM_SLOT_GETATTR:
+			{
+				Var *var = *(Var **)&(vmnode->ops[pc+1]);
+				pc += sizeof(Var *);
+				AttrNumber attrnum = var->varattno;
+				TupleTableSlot *slot;
+				switch (var->varno) 
+				{
+					case INNER_VAR:
+						slot  = econtext->ecxt_innertuple;
+						break;
+					case OUTER_VAR:
+						slot  = econtext->ecxt_outertuple;
+						break;
+					default:
+						slot  = econtext->ecxt_scantuple;
+						break;
+				}
+				val = slot_getattr(slot, attrnum, isNull);
+			}
+				break;
+			default:
+				elog(ERROR, "invalid VM op %d", op);
+				break;
+		}
+	}
+	elog(ERROR, "VM code overrun");
+}
+}
+
+ExprState *
+VmCompile(ExprState *state) 
+{
+	switch (nodeTag(state)) {
+		case T_ExprState:
+		{		
+			int i, done = 0, op = -1;
+			int pc = 0;
+			VmNode *node = makeNode(VmNode);
+			node->xprstate.type = T_VmNode;
+			node->xprstate.expr = state->expr;
+			node->xprstate.evalfunc = ExecEvalVm;
+			node->jit = NULL;
+			if (state->evalfunc == ExecEvalConst) 
+			{
+				Oid type = ((Const *) (state->expr))->consttype;
+				//if (type == 20 || type == 21 || type == 23 || type == 16)
+				{
+					Datum d =((Const *) (state->expr))->constvalue;
+					node->ops[pc++] = VM_LITERAL;
+					*(Datum *)&(node->ops[pc]) = d;
+					pc += sizeof(Datum);
+					node->ops[pc++] = VM_RET;
+					done = 1;
+				}
+				op = -1000 - type;
+			} 
+			else if (state->evalfunc == ExecEvalScalarVar) 
+			{
+				op = -11;
+				node->ops[pc++] = VM_SLOT_GETATTR;
+				*(Var **)&(node->ops[pc]) = (Var *)state->expr;
+				pc += sizeof(Var *);
+				node->ops[pc++] = VM_RET;
+				done = 1;
+				
+			} 
+			else if (state->evalfunc == ExecEvalParamExec)   op = -2;
+			else if (state->evalfunc == ExecEvalParamExtern) op = -3; 
+			else if (state->evalfunc == ExecEvalCoerceToDomainValue) op = -4; 
+			else if (state->evalfunc == ExecEvalCaseTestExpr) op = -5; 
+			else if (state->evalfunc == ExecEvalCurrentOfExpr) op = -6; 
+			else op = -7; 
+			if (!done)
+			{
+#if 0 
+				node->ops[pc++] = VM_CALL2;
+				*(int *)&(node->ops[pc]) = op;
+				pc += sizeof(int);
+#else
+				node->ops[pc++] = VM_CALL;
+elog(NOTICE, "%lx", state);
+#endif
+				
+				*(unsigned long *)&(node->ops[pc]) = state;
+				pc += sizeof(void*);
+				node->ops[pc++] = VM_RET;
+			}
+			node->nops = pc;
+			return node;
+		}	
+			break;
+		case T_FuncExprState:
+		{
+			int pc = 0;
+			VmNode *node = makeNode(VmNode);
+			node->xprstate.type = T_VmNode;
+			node->xprstate.expr = state->expr;
+			node->xprstate.evalfunc = ExecEvalVm;
+			int funcid = -1;
+			if (state->evalfunc == ExecEvalFunc || state->evalfunc == ExecEvalOper) 
+			{
+				int i;
+				List *args = (List *)(((FuncExprState *) state)->args);	
+				ListCell *argCell;
+				foreach (argCell, args) 
+				{
+					ExprState *arg = lfirst(argCell);
+					if (nodeTag(arg) == T_VmNode) 
+					{
+						for (i = 0; i < ((VmNode *) arg)->nops - 1; ++i) 
+						{
+							node->ops[pc++] = ((VmNode *) arg)->ops[i];
+						}
+						node->ops[pc++] = VM_PUSH;
+					} else {
+						node->ops[pc++] = VM_CALL;		
+elog(NOTICE, "%lx", state);
+						*(long *)node->ops[pc] = (long) state;
+						pc += sizeof(long *);
+						node->ops[pc++] = VM_PUSH;
+					}
+				}
+				if (state->evalfunc == ExecEvalFunc)
+				{
+					funcid = ((FuncExpr *)(state->expr))->funcid;
+				}
+				else if (state->evalfunc == ExecEvalOper) 
+				{ 
+					funcid = ((OpExpr *)(state->expr))->opfuncid;
+				}
+				if (funcid == 177) // int4pl
+				{
+					node->ops[pc++] = VM_ADD32;
+					node->ops[pc++] = VM_RET;
+				}
+				else if (funcid == 181) // int4mi
+				{
+					node->ops[pc++] = VM_SUB32;
+					node->ops[pc++] = VM_RET;
+				}
+				else if (funcid == 141) // int4mul
+				{
+					node->ops[pc++] = VM_MULT32;
+					node->ops[pc++] = VM_RET;
+				}
+				else if (funcid == 463) // int8pl
+				{
+					node->ops[pc++] = VM_ADD64;
+					node->ops[pc++] = VM_RET;
+				}
+				else if (funcid == 481) // int8
+				{
+					node->ops[pc++] = VM_INT64;
+					node->ops[pc++] = VM_RET;
+				}
+				else if (funcid == 66) // int4lt
+				{
+					node->ops[pc++] = VM_INT32LT;
+					node->ops[pc++] = VM_RET;
+				}
+				else if (funcid == 65) // int4eq
+				{
+					node->ops[pc++] = VM_INT32EQ;
+					node->ops[pc++] = VM_RET;
+				}
+				else if (funcid == 67) // texteq 
+				{
+					node->ops[pc++] = VM_TEXTEQ;
+					node->ops[pc++] = VM_RET;
+				}
+				else if (funcid == 2311) // md5 
+				{
+					node->ops[pc++] = VM_MD5TEXT;
+					node->ops[pc++] = VM_RET;
+				}
+				else if (funcid == 43) //  int4out
+				{
+					node->ops[pc++] = VM_INT32OUT;
+					node->ops[pc++] = VM_RET;
+				}
+				else if (funcid == 46) // textin 
+				{
+					node->ops[pc++] = VM_TEXTIN;
+					node->ops[pc++] = VM_RET;
+				}
+				else
+				{
+					pc = 0;
+					goto not_int;
+				}
+			}
+			else 
+			{
+not_int:
+#if 0
+				node->ops[pc++] = VM_CALL2;
+				*(int *)&(node->ops[pc]) = funcid;
+				pc += sizeof(int);
+#else
+				node->ops[pc++] = VM_CALL;
+#endif
+elog(NOTICE, "%lx", state);
+				*(unsigned long *)&(node->ops[pc]) = state;
+				pc += sizeof(void*);
+				node->ops[pc++] = VM_RET;
+
+			}
+			node->nops = pc;
+			return node;
+		}
+			break;	
+		default:
+			return state;	
+	}
+}
+
 /*
  * ExecInitExpr: prepare an expression tree for execution
  *
@@ -4346,6 +4732,7 @@ ExecInitExpr(Expr *node, PlanState *parent)
 
 	/* Guard against stack overflow due to overly complex expressions */
 	check_stack_depth();
+//elog_node_display(NOTICE, "init", node, 1);
 
 	switch (nodeTag(node))
 	{
@@ -5035,7 +5422,11 @@ ExecInitExpr(Expr *node, PlanState *parent)
 	/* Common code for all state-node types */
 	state->expr = node;
 
+if (vm_level == 0) {
 	return state;
+} else {
+	return VmCompile(state);
+}
 }
 
 /*

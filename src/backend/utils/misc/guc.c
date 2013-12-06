@@ -1460,6 +1460,8 @@ static struct config_bool ConfigureNamesBool[] =
 };
 
 
+extern int vm_level;
+
 static struct config_int ConfigureNamesInt[] =
 {
 	{
@@ -2405,6 +2407,16 @@ static struct config_int ConfigureNamesInt[] =
 		},
 		&pgstat_track_activity_query_size,
 		1024, 100, 102400,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"vm_level", PGC_USERSET, UNGROUPED,
+			gettext_noop("vm/jit level"),
+			NULL
+		},
+		&vm_level,
+		0, 0, 2,
 		NULL, NULL, NULL
 	},
 
