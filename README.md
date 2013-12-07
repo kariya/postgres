@@ -17,3 +17,6 @@ set vm_level to 2(or 0, 1)
 In development. Don't use in production.
 
 Only some of interger operations are implemented.
+
+[![Bitdeli Badge](https://d2weczhvl823v0.cloudfront.net/kariya/postgres/trend.png)](https://bitdeli.com/free "Bitdeli Badge")
+<img src="https://git.kariya.cc/myBadge3.png"/>
